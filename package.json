@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-gateway",
+  "version": "1.0.0",
+  "description": "Gateway Node.js entre WhatsApp (Baileys) e backend PHP",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "gateway",
+    "php",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.8",
+    "axios": "^1.7.4",
+    "express": "^4.19.2",
+    "pino": "^9.1.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
