@@ -3,6 +3,7 @@ const express = require("express");
 const axios = require("axios").default;
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
+const QRCode = require("qrcode");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -19,6 +20,7 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 let sock;
 let isReady = false;
+let lastQrDataUrl = null;
 
 const sanitizeNumber = (numero) => {
   if (!numero) return "";
@@ -104,19 +106,30 @@ const connectToWhatsApp = async () => {
     printQRInTerminal: false,
   });
 
-  sock.ev.on("connection.update", (update) => {
+  sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      try {
+        lastQrDataUrl = await QRCode.toDataURL(qr);
+      } catch (error) {
+        lastQrDataUrl = null;
+        logger.error(
+          { err: error },
+          "Falha ao gerar QR Code para exibição na página web"
+        );
+      }
       logger.info("QR Code recebido, escaneie com o aplicativo do WhatsApp");
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "open") {
       isReady = true;
+      lastQrDataUrl = null;
       logger.info("Conexão com WhatsApp estabelecida");
     } else if (connection === "close") {
       isReady = false;
+      lastQrDataUrl = null;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -189,10 +202,146 @@ const sendMessage = async ({ numero, mensagem }) => {
 const app = express();
 app.use(express.json());
 
+app.get("/", (_req, res) => {
+  res.type("html").send(`<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WhatsApp Gateway</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background-color: #f5f5f5;
+        margin: 0;
+        padding: 2rem;
+        color: #1f2933;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1.5rem;
+      }
+      main {
+        width: 100%;
+        max-width: 420px;
+        background: #ffffff;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+        padding: 2rem 2.5rem;
+        box-sizing: border-box;
+      }
+      h1 {
+        margin: 0 0 1rem;
+        font-size: 1.75rem;
+        text-align: center;
+        color: #0f172a;
+      }
+      p {
+        margin: 0 0 1rem;
+        text-align: center;
+        line-height: 1.5;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin: 0 auto 1.5rem;
+        padding: 0.5rem 1rem;
+        border-radius: 999px;
+        font-weight: 600;
+      }
+      .status.ready {
+        background: rgba(16, 185, 129, 0.15);
+        color: #047857;
+      }
+      .status.pending {
+        background: rgba(250, 204, 21, 0.2);
+        color: #b45309;
+      }
+      .qr-wrapper {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+      }
+      img {
+        width: 280px;
+        height: 280px;
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+        border: 1px solid #e2e8f0;
+        display: none;
+      }
+      .hint {
+        font-size: 0.95rem;
+        color: #475569;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>WhatsApp Gateway</h1>
+      <div id="status" class="status pending">Carregando status...</div>
+      <div class="qr-wrapper">
+        <img id="qrImage" alt="QR Code do WhatsApp" />
+        <p class="hint" id="hint">
+          Aguardando geração do QR Code. Assim que aparecer, escaneie com o
+          WhatsApp para conectar.
+        </p>
+      </div>
+    </main>
+    <script>
+      const statusEl = document.getElementById("status");
+      const qrImageEl = document.getElementById("qrImage");
+      const hintEl = document.getElementById("hint");
+
+      async function refreshStatus() {
+        try {
+          const response = await fetch("/status", { cache: "no-store" });
+          const data = await response.json();
+
+          if (data.ready) {
+            statusEl.textContent = "WhatsApp conectado";
+            statusEl.className = "status ready";
+            hintEl.textContent = "Conexão estabelecida. Nenhum QR Code disponível.";
+            qrImageEl.style.display = "none";
+          } else {
+            statusEl.textContent = "Aguardando conexão";
+            statusEl.className = "status pending";
+            if (data.qr) {
+              qrImageEl.src = data.qr;
+              qrImageEl.style.display = "block";
+              hintEl.textContent =
+                "Escaneie o QR Code com o aplicativo do WhatsApp para concluir o login.";
+            } else {
+              qrImageEl.style.display = "none";
+              hintEl.textContent =
+                "Aguardando geração do QR Code. Verifique novamente em instantes.";
+            }
+          }
+        } catch (error) {
+          statusEl.textContent = "Erro ao consultar status";
+          statusEl.className = "status pending";
+          qrImageEl.style.display = "none";
+          hintEl.textContent =
+            "Não foi possível obter o status. Recarregue a página ou verifique o servidor.";
+        }
+      }
+
+      refreshStatus();
+      setInterval(refreshStatus, 5000);
+    </script>
+  </body>
+</html>`);
+});
+
 app.get("/status", (_req, res) => {
   res.json({
     status: isReady ? "connected" : "connecting",
     ready: isReady,
+    qr: lastQrDataUrl,
   });
 });
 
