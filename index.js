@@ -1,6 +1,7 @@
 const path = require("path");
 const express = require("express");
 const axios = require("axios").default;
+const FormData = require("form-data");
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
 const QRCode = require("qrcode");
@@ -11,10 +12,12 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   jidNormalizedUser,
+  downloadContentFromMessage,
 } = require("@whiskeysockets/baileys");
 
 const PORT = process.env.PORT;
 const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL;
+const PHP_MEDIA_UPLOAD_URL = process.env.PHP_MEDIA_UPLOAD_URL;
 
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
@@ -67,19 +70,149 @@ const extractMessageText = (message) => {
   return "";
 };
 
-const notifyPhpWebhook = async ({ numero, nome, mensagem }) => {
-  try {
-    await axios.post(
-      PHP_WEBHOOK_URL,
-      {
-        numero,
-        nome,
-        mensagem,
-      },
-      {
-        timeout: 10000,
-      }
+const identifyMediaMessage = (message = {}) => {
+  if (message.imageMessage) {
+    return {
+      mediaType: "image",
+      baileysType: "image",
+      content: message.imageMessage,
+      caption: message.imageMessage.caption || "",
+    };
+  }
+
+  if (message.videoMessage) {
+    return {
+      mediaType: "video",
+      baileysType: "video",
+      content: message.videoMessage,
+      caption: message.videoMessage.caption || "",
+    };
+  }
+
+  if (message.audioMessage) {
+    return {
+      mediaType: "audio",
+      baileysType: "audio",
+      content: message.audioMessage,
+      caption: "",
+    };
+  }
+
+  if (message.documentMessage) {
+    return {
+      mediaType: "document",
+      baileysType: "document",
+      content: message.documentMessage,
+      caption: message.documentMessage.caption || "",
+    };
+  }
+
+  return null;
+};
+
+const downloadMediaBuffer = async (mediaContent, baileysType) => {
+  const stream = await downloadContentFromMessage(mediaContent, baileysType);
+  const chunks = [];
+
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+
+  return Buffer.concat(chunks);
+};
+
+const uploadMediaToPhp = async ({
+  buffer,
+  mediaType,
+  caption,
+  fileName,
+  mimeType,
+}) => {
+  if (!PHP_MEDIA_UPLOAD_URL) {
+    logger.warn(
+      { mediaType },
+      "PHP_MEDIA_UPLOAD_URL não configurada, ignorando upload da mídia"
     );
+    return null;
+  }
+
+  const formData = new FormData();
+  formData.append("file", buffer, {
+    filename: fileName || `${mediaType}-${Date.now()}`,
+    contentType: mimeType || "application/octet-stream",
+  });
+  formData.append("media_type", mediaType);
+
+  if (caption) {
+    formData.append("media_caption", caption);
+  }
+
+  try {
+    const response = await axios.post(PHP_MEDIA_UPLOAD_URL, formData, {
+      headers: formData.getHeaders(),
+      timeout: 30000,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+    });
+
+    return response.data;
+  } catch (error) {
+    logger.error(
+      {
+        err: error?.response?.data || error.message,
+        mediaType,
+      },
+      "Falha ao enviar mídia para o PHP"
+    );
+    return null;
+  }
+};
+
+const processIncomingMedia = async (message) => {
+  const mediaDetails = identifyMediaMessage(message);
+
+  if (!mediaDetails) {
+    return null;
+  }
+
+  try {
+    const buffer = await downloadMediaBuffer(
+      mediaDetails.content,
+      mediaDetails.baileysType
+    );
+
+    const uploadResult = await uploadMediaToPhp({
+      buffer,
+      mediaType: mediaDetails.mediaType,
+      caption: mediaDetails.caption,
+      fileName:
+        mediaDetails.content?.fileName ||
+        `${mediaDetails.mediaType}-${Date.now()}`,
+      mimeType: mediaDetails.content?.mimetype,
+    });
+
+    return {
+      mediaType: mediaDetails.mediaType,
+      caption: mediaDetails.caption,
+      uploadResult,
+    };
+  } catch (error) {
+    logger.error(
+      {
+        err: error.message,
+        mediaType: mediaDetails.mediaType,
+      },
+      "Falha ao baixar mídia do WhatsApp"
+    );
+    return null;
+  }
+};
+
+const notifyPhpWebhook = async (payload) => {
+  try {
+    await axios.post(PHP_WEBHOOK_URL, payload, {
+      timeout: 10000,
+    });
     logger.debug({ numero }, "Webhook enviado ao PHP com sucesso");
   } catch (error) {
     logger.error(
@@ -163,8 +296,9 @@ const connectToWhatsApp = async () => {
       }
 
       const messageText = extractMessageText(messageObj.message);
+      const mediaInfo = await processIncomingMedia(messageObj.message);
 
-      if (!messageText) {
+      if (!messageText && !mediaInfo) {
         continue;
       }
 
@@ -173,11 +307,25 @@ const connectToWhatsApp = async () => {
 
       logger.info({ numero }, "Mensagem recebida do WhatsApp");
 
-      await notifyPhpWebhook({
+      const payload = {
         numero,
         nome,
-        mensagem: messageText,
-      });
+        mensagem: messageText || "",
+      };
+
+      if (mediaInfo) {
+        payload.media_type = mediaInfo.mediaType;
+        payload.media_caption = mediaInfo.caption || "";
+
+        const uploadData =
+          mediaInfo.uploadResult?.data || mediaInfo.uploadResult || {};
+
+        payload.media_url = uploadData.media_url || null;
+        payload.media_local_url = uploadData.media_local_url || null;
+        payload.media_remote_url = uploadData.media_remote_url || null;
+      }
+
+      await notifyPhpWebhook(payload);
     }
   });
 
