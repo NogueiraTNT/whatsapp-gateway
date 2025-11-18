@@ -19,7 +19,42 @@ const PORT = process.env.PORT;
 const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL;
 const PHP_MEDIA_UPLOAD_URL = process.env.PHP_MEDIA_UPLOAD_URL;
 
-const logger = pino({ level: process.env.LOG_LEVEL || "info" });
+// Configurar logger para filtrar erros conhecidos de descriptografia
+const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+  hooks: {
+    logMethod(inputArgs, method) {
+      const msg = inputArgs[inputArgs.length - 1];
+      const attributes = inputArgs[0]?.attributes || inputArgs[0]?.err;
+
+      // Filtrar erros "No session record" e "failed to decrypt message" - são esperados com contatos novos
+      if (attributes && typeof attributes === "object") {
+        const errMessage = attributes.message || attributes.err?.message || "";
+        const errName = attributes.err?.name || "";
+
+        if (
+          (errMessage.includes("No session record") ||
+            errMessage.includes("failed to decrypt message") ||
+            errName === "SessionError") &&
+          typeof msg === "string" &&
+          msg.includes("failed to decrypt message")
+        ) {
+          // Logar como debug/warn ao invés de error para não poluir os logs
+          return method.call(
+            this,
+            {
+              ...inputArgs[0],
+              level: 30, // warn level
+            },
+            "Mensagem de contato novo não descriptografada (sessão ainda não estabelecida - normal)"
+          );
+        }
+      }
+
+      return method.apply(this, inputArgs);
+    },
+  },
+});
 
 let sock;
 let isReady = false;
@@ -213,11 +248,15 @@ const notifyPhpWebhook = async (payload) => {
     await axios.post(PHP_WEBHOOK_URL, payload, {
       timeout: 10000,
     });
-    logger.debug({ numero }, "Webhook enviado ao PHP com sucesso");
+    logger.debug(
+      { numero: payload.numero },
+      "Webhook enviado ao PHP com sucesso"
+    );
   } catch (error) {
     logger.error(
       {
         err: error?.response?.data || error.message,
+        numero: payload.numero,
       },
       "Falha ao chamar webhook PHP"
     );
@@ -279,53 +318,120 @@ const connectToWhatsApp = async () => {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // Handler para mensagens atualizadas (incluindo pré-criptográficas de contatos novos)
+  sock.ev.on("messages.update", async (updates) => {
+    for (const update of updates) {
+      // Processar senderKeyDistributionMessage para estabelecer sessão com contatos novos
+      if (update.update?.message?.senderKeyDistributionMessage) {
+        const remoteJid = jidNormalizedUser(update.key?.remoteJid || "");
+
+        if (remoteJid && remoteJid.endsWith("@s.whatsapp.net")) {
+          logger.debug(
+            { remoteJid },
+            "Sessão criptográfica estabelecida com contato novo"
+          );
+        }
+      }
+    }
+  });
+
   sock.ev.on("messages.upsert", async (event) => {
     if (event.type !== "notify") {
       return;
     }
 
     for (const messageObj of event.messages) {
-      const remoteJid = jidNormalizedUser(messageObj.key.remoteJid || "");
+      try {
+        const remoteJid = jidNormalizedUser(messageObj.key.remoteJid || "");
 
-      if (!remoteJid.endsWith("@s.whatsapp.net")) {
-        continue;
+        if (!remoteJid.endsWith("@s.whatsapp.net")) {
+          continue;
+        }
+
+        if (messageObj.key.fromMe) {
+          continue;
+        }
+
+        // Verificar se a mensagem tem conteúdo válido ou é apenas uma atualização de pré-criptografia
+        if (!messageObj.message) {
+          continue;
+        }
+
+        const messageText = extractMessageText(messageObj.message);
+        const mediaInfo = await processIncomingMedia(messageObj.message);
+
+        // Se não tem texto nem mídia, pode ser uma mensagem pré-criptográfica
+        // Tentar processar mesmo assim para não perder mensagens
+        if (!messageText && !mediaInfo) {
+          // Verificar se é mensagem pré-criptográfica (senderKeyDistributionMessage)
+          if (messageObj.message.senderKeyDistributionMessage) {
+            logger.debug(
+              { remoteJid },
+              "Mensagem pré-criptográfica recebida - sessão será estabelecida"
+            );
+            continue;
+          }
+
+          // Se não é nenhum tipo conhecido, pular
+          continue;
+        }
+
+        const numero = sanitizeNumber(remoteJid);
+        const nome = messageObj.pushName || numero;
+
+        logger.info({ numero }, "Mensagem recebida do WhatsApp");
+
+        const payload = {
+          numero,
+          nome,
+          mensagem: messageText || "",
+        };
+
+        if (mediaInfo) {
+          payload.media_type = mediaInfo.mediaType;
+          payload.media_caption = mediaInfo.caption || "";
+
+          const uploadData =
+            mediaInfo.uploadResult?.data || mediaInfo.uploadResult || {};
+
+          payload.media_url = uploadData.media_url || null;
+          payload.media_local_url = uploadData.media_local_url || null;
+          payload.media_remote_url = uploadData.media_remote_url || null;
+        }
+
+        await notifyPhpWebhook(payload);
+      } catch (error) {
+        // Tratar erros de descriptografia especificamente
+        const errorMessage = error?.message || "";
+        const errorName = error?.name || "";
+
+        if (
+          errorMessage.includes("No session record") ||
+          errorMessage.includes("failed to decrypt message") ||
+          errorName === "SessionError"
+        ) {
+          // Erro esperado com contatos novos - logar mas não quebrar o processamento
+          const remoteJid = jidNormalizedUser(messageObj?.key?.remoteJid || "");
+          logger.warn(
+            {
+              remoteJid,
+              messageId: messageObj?.key?.id,
+            },
+            "Mensagem não descriptografada (contato novo - próxima mensagem será processada)"
+          );
+          // Continuar processando outras mensagens
+          continue;
+        }
+
+        // Para outros erros, logar e continuar
+        logger.error(
+          {
+            err: error,
+            remoteJid: messageObj?.key?.remoteJid,
+          },
+          "Erro ao processar mensagem recebida"
+        );
       }
-
-      if (messageObj.key.fromMe) {
-        continue;
-      }
-
-      const messageText = extractMessageText(messageObj.message);
-      const mediaInfo = await processIncomingMedia(messageObj.message);
-
-      if (!messageText && !mediaInfo) {
-        continue;
-      }
-
-      const numero = sanitizeNumber(remoteJid);
-      const nome = messageObj.pushName || numero;
-
-      logger.info({ numero }, "Mensagem recebida do WhatsApp");
-
-      const payload = {
-        numero,
-        nome,
-        mensagem: messageText || "",
-      };
-
-      if (mediaInfo) {
-        payload.media_type = mediaInfo.mediaType;
-        payload.media_caption = mediaInfo.caption || "";
-
-        const uploadData =
-          mediaInfo.uploadResult?.data || mediaInfo.uploadResult || {};
-
-        payload.media_url = uploadData.media_url || null;
-        payload.media_local_url = uploadData.media_local_url || null;
-        payload.media_remote_url = uploadData.media_remote_url || null;
-      }
-
-      await notifyPhpWebhook(payload);
     }
   });
 
