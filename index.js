@@ -67,6 +67,10 @@ const messageRetryQueue = new Map();
 // Mapa para rastrear tentativas de primeiro contato
 const newContactAttempts = new Map();
 
+// ✅ DEBUG: Mapa para rastrear mensagens rejeitadas (últimas 100)
+const rejectedMessages = [];
+const MAX_REJECTED_TRACK = 100;
+
 // Sistema de reconexão com backoff exponencial
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
@@ -93,14 +97,17 @@ const extractMessageText = (message) => {
     return "";
   }
 
+  // Texto simples
   if (message.conversation) {
     return message.conversation;
   }
 
+  // Texto estendido
   if (message.extendedTextMessage?.text) {
     return message.extendedTextMessage.text;
   }
 
+  // Captions de mídia
   if (message.imageMessage?.caption) {
     return message.imageMessage.caption;
   }
@@ -109,12 +116,59 @@ const extractMessageText = (message) => {
     return message.videoMessage.caption;
   }
 
+  if (message.documentMessage?.caption) {
+    return message.documentMessage.caption;
+  }
+
+  // Respostas de botões e listas
   if (message.buttonsResponseMessage?.selectedButtonId) {
-    return message.buttonsResponseMessage.selectedButtonId;
+    return `[Botão: ${message.buttonsResponseMessage.selectedButtonId}]`;
   }
 
   if (message.listResponseMessage?.singleSelectReply?.selectedRowId) {
-    return message.listResponseMessage.singleSelectReply.selectedRowId;
+    return `[Lista: ${message.listResponseMessage.singleSelectReply.selectedRowId}]`;
+  }
+
+  // ✅ NOVO: Suporte para mais tipos de mensagem
+  if (message.stickerMessage) {
+    return "📎 Sticker recebido";
+  }
+
+  if (message.contactMessage) {
+    const name = message.contactMessage?.displayName || "Contato";
+    const phone =
+      message.contactMessage?.vcard?.match(/TEL[:\+]*(\d+)/)?.[1] || "";
+    return `📇 Contato compartilhado: ${name}${phone ? ` (${phone})` : ""}`;
+  }
+
+  if (message.locationMessage) {
+    const lat = message.locationMessage?.degreesLatitude || 0;
+    const lng = message.locationMessage?.degreesLongitude || 0;
+    return `📍 Localização: https://maps.google.com/?q=${lat},${lng}`;
+  }
+
+  if (message.liveLocationMessage) {
+    const lat = message.liveLocationMessage?.degreesLatitude || 0;
+    const lng = message.liveLocationMessage?.degreesLongitude || 0;
+    return `📍 Localização em tempo real: https://maps.google.com/?q=${lat},${lng}`;
+  }
+
+  if (message.pollCreationMessage) {
+    return "📊 Enquete criada";
+  }
+
+  if (message.pollUpdateMessage) {
+    return "📊 Voto em enquete";
+  }
+
+  if (message.reactionMessage) {
+    const reaction = message.reactionMessage?.text || "👍";
+    return `Reagiu: ${reaction}`;
+  }
+
+  // Protocol messages (geralmente não precisam ser processadas como mensagem)
+  if (message.protocolMessage) {
+    return null; // Retornar null indica que é mensagem de protocolo
   }
 
   return "";
@@ -759,16 +813,67 @@ const connectToWhatsApp = async () => {
       return;
     }
 
-    for (const messageObj of event.messages) {
-      try {
-        const remoteJid = jidNormalizedUser(messageObj.key.remoteJid || "");
+    // ✅ DEBUG: Log de todas as mensagens recebidas
+    logger.debug(
+      {
+        totalMessages: event.messages?.length || 0,
+        eventType: event.type,
+      },
+      `Evento messages.upsert recebido com ${
+        event.messages?.length || 0
+      } mensagem(ns)`
+    );
 
-        if (!remoteJid.endsWith("@s.whatsapp.net")) {
+    for (const messageObj of event.messages) {
+      let remoteJid = null;
+      let rejectReason = null;
+
+      try {
+        // ✅ Verificação segura do key
+        if (!messageObj?.key) {
+          rejectReason = "messageObj.key é null/undefined";
+          logger.warn({ messageObj }, "Mensagem sem key - rejeitada");
           continue;
         }
 
-        if (messageObj.key.fromMe) {
+        // ✅ Verificação segura do remoteJid
+        try {
+          remoteJid = jidNormalizedUser(messageObj.key.remoteJid || "");
+        } catch (error) {
+          rejectReason = `Erro ao normalizar JID: ${error.message}`;
+          logger.error(
+            {
+              err: error,
+              rawRemoteJid: messageObj.key.remoteJid,
+            },
+            "Erro ao normalizar remoteJid"
+          );
           continue;
+        }
+
+        // ✅ ACEITAR também mensagens de grupos (@g.us) e broadcasts (@broadcast)
+        // Mas processar apenas mensagens individuais (@s.whatsapp.net)
+        if (
+          !remoteJid ||
+          (!remoteJid.endsWith("@s.whatsapp.net") &&
+            !remoteJid.endsWith("@g.us") &&
+            !remoteJid.endsWith("@broadcast"))
+        ) {
+          rejectReason = `JID não suportado: ${remoteJid}`;
+          logger.debug(
+            { remoteJid, messageId: messageObj.key?.id },
+            "Mensagem rejeitada - JID não é individual, grupo ou broadcast"
+          );
+          continue;
+        }
+
+        // ✅ Processar apenas mensagens individuais (@s.whatsapp.net)
+        if (!remoteJid.endsWith("@s.whatsapp.net")) {
+          continue; // Ignorar grupos e broadcasts por enquanto
+        }
+
+        if (messageObj.key.fromMe) {
+          continue; // Ignorar mensagens próprias
         }
 
         // ✅ NOVO: Verificar se mensagem está na fila de retry
@@ -778,8 +883,29 @@ const connectToWhatsApp = async () => {
         // ✅ Rastrear tentativas de novos contatos
         trackNewContactAttempt(remoteJid);
 
-        // Verificar se a mensagem tem conteúdo válido ou é apenas uma atualização de pré-criptografia
+        // ✅ Verificação mais detalhada do message
         if (!messageObj.message) {
+          rejectReason = "messageObj.message é null/undefined";
+          logger.debug(
+            {
+              remoteJid,
+              messageId: messageObj.key?.id,
+              messageKey: messageObj.key,
+            },
+            "Mensagem sem conteúdo - pode ser update ou protocolo"
+          );
+
+          // ✅ Rastrear mensagens rejeitadas
+          rejectedMessages.unshift({
+            timestamp: Date.now(),
+            remoteJid: remoteJid || "unknown",
+            messageId: messageObj.key?.id,
+            reason: rejectReason,
+            key: messageObj.key,
+          });
+          if (rejectedMessages.length > MAX_REJECTED_TRACK) {
+            rejectedMessages.pop();
+          }
           continue;
         }
 
@@ -792,105 +918,257 @@ const connectToWhatsApp = async () => {
           continue;
         }
 
-        const messageText = extractMessageText(messageObj.message);
-        const mediaInfo = await processIncomingMedia(messageObj.message);
+        // ✅ Processar texto PRIMEIRO (pode ter texto mesmo sem mídia)
+        let messageText = null;
+        try {
+          messageText = extractMessageText(messageObj.message);
+          // Se retornar null, é mensagem de protocolo - ignorar
+          if (messageText === null) {
+            continue;
+          }
+        } catch (error) {
+          logger.warn(
+            {
+              err: error,
+              remoteJid,
+              messageId: messageObj.key?.id,
+            },
+            "Erro ao extrair texto da mensagem - continuando com processamento de mídia"
+          );
+          // Continuar mesmo se erro na extração de texto
+        }
 
-        if (!messageText && !mediaInfo) {
+        // ✅ Processar mídia com tratamento de erro melhorado
+        let mediaInfo = null;
+        try {
+          mediaInfo = await processIncomingMedia(messageObj.message);
+        } catch (error) {
+          logger.warn(
+            {
+              err: error.message,
+              remoteJid,
+              messageId: messageObj.key?.id,
+            },
+            "Erro ao processar mídia - continuando sem mídia"
+          );
+          // ✅ NÃO rejeitar mensagem se mídia falhar mas tiver texto
+          mediaInfo = null;
+        }
+
+        // ✅ ACEITAR mensagem se tiver texto OU mídia (ou ambos)
+        // Se não tiver nenhum, pode ser um tipo não suportado
+        if (
+          (messageText === null || messageText === "" || !messageText) &&
+          !mediaInfo
+        ) {
+          rejectReason = "Sem texto e sem mídia detectada";
+          const messageKeys = Object.keys(messageObj.message || {});
+          logger.warn(
+            {
+              remoteJid,
+              messageId: messageObj.key?.id,
+              messageTypes: messageKeys,
+              fullMessage: JSON.stringify(messageObj.message).substring(0, 500),
+            },
+            "Mensagem rejeitada - tipo não suportado ou vazio"
+          );
+
+          // ✅ Rastrear mensagens rejeitadas
+          rejectedMessages.unshift({
+            timestamp: Date.now(),
+            remoteJid: remoteJid || "unknown",
+            messageId: messageObj.key?.id,
+            reason: rejectReason,
+            messageTypes: messageKeys,
+            pushName: messageObj.pushName,
+          });
+          if (rejectedMessages.length > MAX_REJECTED_TRACK) {
+            rejectedMessages.pop();
+          }
           continue;
         }
 
         const numero = sanitizeNumber(remoteJid);
         const nome = messageObj.pushName || numero;
 
-        logger.info({ numero }, "Mensagem recebida do WhatsApp");
+        logger.info(
+          {
+            numero,
+            remoteJid,
+            messageId: messageObj.key?.id,
+            hasText: !!messageText,
+            hasMedia: !!mediaInfo,
+          },
+          "Mensagem recebida do WhatsApp - processando"
+        );
 
         const payload = {
           numero,
           nome,
-          mensagem: messageText || "",
+          mensagem: messageText && messageText !== null ? messageText : "",
         };
 
-        if (mediaInfo && mediaInfo.uploadResult) {
-          const upload = mediaInfo.uploadResult;
+        // ✅ Processar mídia apenas se uploadResult existir
+        if (mediaInfo) {
+          if (mediaInfo.uploadResult) {
+            const upload = mediaInfo.uploadResult;
 
-          // ✅ Garantir que local_url está presente
-          if (upload.media_local_url || upload.media_url) {
-            payload.media_type = mediaInfo.mediaType;
-            payload.media_caption = mediaInfo.caption || "";
-            payload.media_local_url =
-              upload.media_local_url || upload.media_url;
-            payload.media_url = upload.media_url || upload.media_local_url;
-            payload.relative_path = upload.relative_path || null;
-            payload.media_mime = upload.mime || null;
-
-            // ✅ NÃO incluir remote_url se já temos local_url
-            // (evita tentativa de download duplicado)
+            // ✅ Garantir que local_url está presente
+            if (upload.media_local_url || upload.media_url) {
+              payload.media_type = mediaInfo.mediaType;
+              payload.media_caption = mediaInfo.caption || "";
+              payload.media_local_url =
+                upload.media_local_url || upload.media_url;
+              payload.media_url = upload.media_url || upload.media_local_url;
+              payload.relative_path = upload.relative_path || null;
+              payload.media_mime = upload.mime || null;
+            } else {
+              // ⚠️ Fallback: Se upload falhou, incluir apenas metadados
+              logger.warn(
+                {
+                  mediaType: mediaInfo.mediaType,
+                  remoteJid,
+                  messageId: messageObj.key?.id,
+                },
+                "Upload de mídia falhou - incluindo apenas metadados no webhook"
+              );
+              payload.media_type = mediaInfo.mediaType;
+              payload.media_caption = mediaInfo.caption || "";
+            }
           } else {
-            // ⚠️ Fallback: Se upload falhou, incluir apenas metadados
+            // ✅ Se processIncomingMedia retornou objeto mas sem uploadResult
+            // (pode ter falhado silenciosamente)
             logger.warn(
-              { mediaType: mediaInfo.mediaType },
-              "Upload de mídia falhou - incluindo apenas metadados no webhook"
+              {
+                mediaType: mediaInfo.mediaType,
+                remoteJid,
+                messageId: messageObj.key?.id,
+              },
+              "Mídia detectada mas uploadResult ausente - incluindo apenas metadados"
             );
             payload.media_type = mediaInfo.mediaType;
             payload.media_caption = mediaInfo.caption || "";
-            // ⚠️ PHP tentará baixar do remote_url como fallback
           }
         }
 
-        await notifyPhpWebhook(payload);
-        markContactNotified(remoteJid);
+        // ✅ Tentar enviar webhook com retry
+        try {
+          await notifyPhpWebhook(payload);
+          logger.info(
+            {
+              numero,
+              messageId: messageObj.key?.id,
+            },
+            "Webhook enviado com sucesso"
+          );
+          markContactNotified(remoteJid);
+        } catch (webhookError) {
+          logger.error(
+            {
+              err: webhookError,
+              remoteJid,
+              messageId: messageObj.key?.id,
+              payload,
+            },
+            "Falha ao enviar webhook - mensagem pode ter sido perdida"
+          );
+          // ✅ Não rejeitar - tentar novamente pode ser implementado
+        }
       } catch (error) {
-        // Tratar erros de descriptografia especificamente
+        // ✅ Logging mais detalhado de TODOS os erros
         const errorMessage = error?.message || "";
         const errorName = error?.name || "";
+        const errorStack = error?.stack || "";
 
-        if (
-          errorMessage.includes("No session record") ||
-          errorMessage.includes("failed to decrypt message") ||
-          errorName === "SessionError"
-        ) {
-          const remoteJid = jidNormalizedUser(messageObj?.key?.remoteJid || "");
-
-          // ✅ Se é novo contato e mensagem falhou, notificar PHP mesmo sem conteúdo
-          if (isNewContact(remoteJid)) {
-            const numero = sanitizeNumber(remoteJid);
-
-            // Notificar PHP sobre tentativa de contato (mesmo sem mensagem descriptografada)
-            await notifyPhpWebhook({
-              numero,
-              nome: `Contato ${numero.substring(numero.length - 4)}`, // Nome padrão
-              mensagem: "", // Vazio - indicando que não foi possível descriptografar
-              is_decryption_failed: true,
-              is_new_contact: true,
-              timestamp: Date.now(),
-            });
-
-            markContactNotified(remoteJid);
-          }
-
-          // ✅ MODIFICADO: Ao invés de apenas logar, adicionar à fila
-          if (remoteJid && messageObj?.key) {
-            addToRetryQueue(remoteJid, messageObj.key);
-          }
-
-          logger.warn(
-            {
-              remoteJid,
-              messageId: messageObj?.key?.id,
-            },
-            "Mensagem não descriptografada (contato novo) - adicionada à fila de retry"
-          );
-          continue;
-        }
-
-        // Para outros erros, logar e continuar
         logger.error(
           {
-            err: error,
-            remoteJid: messageObj?.key?.remoteJid,
+            err: {
+              message: errorMessage,
+              name: errorName,
+              stack: errorStack.substring(0, 500),
+            },
+            remoteJid: remoteJid || messageObj?.key?.remoteJid || "unknown",
+            messageId: messageObj?.key?.id,
+            messageKey: messageObj?.key,
+            pushName: messageObj?.pushName,
           },
-          "Erro ao processar mensagem recebida"
+          "ERRO GERAL ao processar mensagem recebida"
         );
+
+        // ✅ Tratar erros de descriptografia especificamente
+        const isDecryptionError =
+          errorMessage.includes("No session record") ||
+          errorMessage.includes("failed to decrypt message") ||
+          errorMessage.includes("SessionError") ||
+          errorName === "SessionError" ||
+          errorStack.includes("SessionError");
+
+        if (isDecryptionError) {
+          const remoteJidFallback =
+            remoteJid || jidNormalizedUser(messageObj?.key?.remoteJid || "");
+
+          if (
+            remoteJidFallback &&
+            remoteJidFallback.endsWith("@s.whatsapp.net")
+          ) {
+            // ✅ Se é novo contato e mensagem falhou, notificar PHP mesmo sem conteúdo
+            if (isNewContact(remoteJidFallback)) {
+              const numero = sanitizeNumber(remoteJidFallback);
+
+              try {
+                // Notificar PHP sobre tentativa de contato (mesmo sem mensagem descriptografada)
+                await notifyPhpWebhook({
+                  numero,
+                  nome: `Contato ${numero.substring(numero.length - 4)}`,
+                  mensagem: "",
+                  is_decryption_failed: true,
+                  is_new_contact: true,
+                  timestamp: Date.now(),
+                });
+
+                markContactNotified(remoteJidFallback);
+              } catch (notifyError) {
+                logger.error(
+                  {
+                    err: notifyError,
+                    remoteJid: remoteJidFallback,
+                  },
+                  "Falha ao notificar PHP sobre novo contato"
+                );
+              }
+            }
+
+            // ✅ MODIFICADO: Ao invés de apenas logar, adicionar à fila
+            if (remoteJidFallback && messageObj?.key) {
+              addToRetryQueue(remoteJidFallback, messageObj.key);
+            }
+
+            logger.warn(
+              {
+                remoteJid: remoteJidFallback,
+                messageId: messageObj?.key?.id,
+                errorMessage,
+                errorName,
+              },
+              "Mensagem não descriptografada - adicionada à fila de retry"
+            );
+          }
+        } else {
+          // ✅ Rastrear outros erros como mensagens rejeitadas
+          rejectedMessages.unshift({
+            timestamp: Date.now(),
+            remoteJid: remoteJid || messageObj?.key?.remoteJid || "unknown",
+            messageId: messageObj?.key?.id,
+            reason: `Erro: ${errorName} - ${errorMessage.substring(0, 100)}`,
+            error: {
+              name: errorName,
+              message: errorMessage.substring(0, 200),
+            },
+          });
+          if (rejectedMessages.length > MAX_REJECTED_TRACK) {
+            rejectedMessages.pop();
+          }
+        }
       }
     }
   });
@@ -1097,6 +1375,26 @@ app.get("/retry-queue/stats", (_req, res) => {
   res.json(stats);
 });
 
+// ✅ DEBUG: Endpoint para ver mensagens rejeitadas
+app.get("/debug/rejected-messages", (_req, res) => {
+  res.json({
+    total: rejectedMessages.length,
+    maxTrack: MAX_REJECTED_TRACK,
+    messages: rejectedMessages.slice(0, 50), // Últimas 50 para não sobrecarregar
+  });
+});
+
+// ✅ Limpar mensagens rejeitadas (endpoint de manutenção)
+app.post("/debug/clear-rejected", (_req, res) => {
+  const before = rejectedMessages.length;
+  rejectedMessages.length = 0;
+  res.json({
+    success: true,
+    cleared: before,
+    message: "Mensagens rejeitadas limpas",
+  });
+});
+
 app.post("/enviar-msg", async (req, res) => {
   const numero = req.body?.numero;
   const mensagem = req.body?.mensagem;
@@ -1119,6 +1417,11 @@ app.post("/enviar-msg", async (req, res) => {
     });
   }
 });
+
+// Limpar mensagens expiradas a cada 30 segundos
+setInterval(() => {
+  cleanupExpiredMessages();
+}, 30000);
 
 app.listen(PORT, () => {
   logger.info(`Servidor Express rodando na porta ${PORT}`);
