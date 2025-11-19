@@ -59,6 +59,21 @@ const logger = pino({
 let sock;
 let isReady = false;
 let lastQrDataUrl = null;
+let lastConnectionTime = null;
+
+// Sistema de fila de retry para mensagens perdidas
+const messageRetryQueue = new Map();
+
+// Mapa para rastrear tentativas de primeiro contato
+const newContactAttempts = new Map();
+
+// Sistema de reconexão com backoff exponencial
+let reconnectAttempts = 0;
+let reconnectTimeout = null;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const INITIAL_RECONNECT_DELAY = 1000; // 1 segundo
+const MAX_RECONNECT_DELAY = 60000; // 60 segundos
+const MAX_WAIT_TIME = 10000; // 10 segundos para fila de retry
 
 const sanitizeNumber = (numero) => {
   if (!numero) return "";
@@ -162,6 +177,7 @@ const uploadMediaToPhp = async ({
   caption,
   fileName,
   mimeType,
+  retries = 0,
 }) => {
   if (!PHP_MEDIA_UPLOAD_URL) {
     logger.warn(
@@ -170,6 +186,8 @@ const uploadMediaToPhp = async ({
     );
     return null;
   }
+
+  const MAX_RETRIES = 2;
 
   const formData = new FormData();
   formData.append("file", buffer, {
@@ -185,19 +203,69 @@ const uploadMediaToPhp = async ({
   try {
     const response = await axios.post(PHP_MEDIA_UPLOAD_URL, formData, {
       headers: formData.getHeaders(),
-      timeout: 30000,
+      timeout: 60000, // ✅ AUMENTADO para 60 segundos
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
     });
 
-    return response.data;
+    // ✅ VALIDAR resposta antes de retornar
+    if (
+      response.data &&
+      response.data.success &&
+      response.data.media_local_url
+    ) {
+      return {
+        success: true,
+        media_local_url: response.data.media_local_url,
+        media_url: response.data.media_url,
+        relative_path: response.data.relative_path,
+        mime: response.data.mime || mimeType,
+      };
+    }
+
+    logger.warn(
+      { response: response.data },
+      "Upload retornou resposta inválida"
+    );
+    return null;
   } catch (error) {
+    // ✅ Retry para erros de timeout ou rede
+    if (
+      retries < MAX_RETRIES &&
+      (error.code === "ECONNABORTED" || // Timeout
+        error.code === "ECONNRESET" || // Conexão resetada
+        error.code === "ETIMEDOUT") // Timeout de conexão
+    ) {
+      logger.warn(
+        {
+          mediaType,
+          attempt: retries + 1,
+          maxRetries: MAX_RETRIES,
+        },
+        "Retentando upload de mídia após falha de rede"
+      );
+
+      // Aguardar antes de retry (backoff exponencial)
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (retries + 1)));
+
+      return uploadMediaToPhp({
+        buffer,
+        mediaType,
+        caption,
+        fileName,
+        mimeType,
+        retries: retries + 1,
+      });
+    }
+
+    // Se não for erro recuperável, logar e retornar null
     logger.error(
       {
         err: error?.response?.data || error.message,
         mediaType,
+        retries,
       },
-      "Falha ao enviar mídia para o PHP"
+      "Falha ao enviar mídia para o PHP após retries"
     );
     return null;
   }
@@ -263,7 +331,274 @@ const notifyPhpWebhook = async (payload) => {
   }
 };
 
+// ==================== SISTEMA DE FILA DE RETRY ====================
+
+/**
+ * Adiciona mensagem à fila de retry
+ */
+function addToRetryQueue(remoteJid, messageKey) {
+  if (!messageRetryQueue.has(remoteJid)) {
+    messageRetryQueue.set(remoteJid, []);
+  }
+
+  const queue = messageRetryQueue.get(remoteJid);
+
+  // Verificar duplicatas (evitar adicionar mesma mensagem 2x)
+  const exists = queue.some(
+    (item) =>
+      item.messageKey.id === messageKey.id &&
+      item.messageKey.fromMe === messageKey.fromMe
+  );
+
+  if (!exists) {
+    queue.push({
+      messageKey,
+      remoteJid,
+      timestamp: Date.now(),
+      retries: 0,
+      lastRetry: null,
+    });
+
+    logger.debug(
+      { remoteJid, messageId: messageKey.id, queueSize: queue.length },
+      "Mensagem adicionada à fila de retry"
+    );
+  }
+}
+
+/**
+ * Remove mensagem da fila após processamento bem-sucedido
+ */
+function removeFromRetryQueue(remoteJid, messageKey) {
+  const queue = messageRetryQueue.get(remoteJid);
+  if (!queue) return;
+
+  const index = queue.findIndex(
+    (item) =>
+      item.messageKey.id === messageKey.id &&
+      item.messageKey.fromMe === messageKey.fromMe
+  );
+
+  if (index !== -1) {
+    const removed = queue.splice(index, 1)[0];
+    logger.info(
+      {
+        remoteJid,
+        messageId: messageKey.id,
+        retries: removed.retries,
+        waitTime: Date.now() - removed.timestamp,
+      },
+      "Mensagem recuperada e removida da fila de retry"
+    );
+  }
+
+  // Limpar JID da fila se não houver mais mensagens
+  if (queue.length === 0) {
+    messageRetryQueue.delete(remoteJid);
+  }
+}
+
+/**
+ * Limpa mensagens expiradas da fila (timeout de 10 segundos)
+ */
+function cleanupExpiredMessages() {
+  const now = Date.now();
+
+  for (const [remoteJid, queue] of messageRetryQueue.entries()) {
+    const beforeSize = queue.length;
+
+    // Remover mensagens expiradas
+    const filtered = queue.filter((item) => {
+      const age = now - item.timestamp;
+      if (age > MAX_WAIT_TIME) {
+        logger.warn(
+          {
+            remoteJid,
+            messageId: item.messageKey.id,
+            age,
+            retries: item.retries,
+          },
+          "Mensagem expirada na fila de retry - removida"
+        );
+        return false;
+      }
+      return true;
+    });
+
+    if (filtered.length !== beforeSize) {
+      messageRetryQueue.set(remoteJid, filtered);
+    }
+
+    // Remover JID se fila estiver vazia
+    if (filtered.length === 0) {
+      messageRetryQueue.delete(remoteJid);
+    }
+  }
+}
+
+/**
+ * Tenta reprocessar mensagens da fila para um JID específico
+ */
+async function retryQueuedMessages(remoteJid) {
+  const queue = messageRetryQueue.get(remoteJid);
+  if (!queue || queue.length === 0) {
+    return;
+  }
+
+  logger.debug(
+    { remoteJid, queueSize: queue.length },
+    "Iniciando retry de mensagens na fila"
+  );
+
+  // Processar cada mensagem na fila
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const item = queue[i];
+
+    // Verificar se excedeu número máximo de tentativas
+    if (item.retries >= 3) {
+      logger.error(
+        {
+          remoteJid,
+          messageId: item.messageKey.id,
+          retries: item.retries,
+        },
+        "Mensagem falhou após múltiplas tentativas - removendo da fila"
+      );
+      queue.splice(i, 1);
+      continue;
+    }
+
+    // Verificar se deve aguardar antes de retry (rate limiting)
+    const now = Date.now();
+    if (item.lastRetry && now - item.lastRetry < 1000) {
+      continue; // Aguardar pelo menos 1 segundo entre retries
+    }
+
+    item.retries++;
+    item.lastRetry = now;
+
+    try {
+      logger.debug(
+        {
+          remoteJid,
+          messageId: item.messageKey.id,
+          attempt: item.retries,
+        },
+        "Tentando reprocessar mensagem da fila"
+      );
+
+      // Aguardar um pouco para garantir que o Baileys processou a sessão
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch (error) {
+      logger.error(
+        {
+          remoteJid,
+          messageId: item.messageKey.id,
+          attempt: item.retries,
+          err: error,
+        },
+        "Erro ao tentar reprocessar mensagem da fila"
+      );
+    }
+  }
+
+  // Atualizar fila após processamento
+  if (queue.length === 0) {
+    messageRetryQueue.delete(remoteJid);
+  } else {
+    messageRetryQueue.set(remoteJid, queue);
+  }
+}
+
+// ==================== SISTEMA DE NOVOS CONTATOS ====================
+
+function trackNewContactAttempt(remoteJid) {
+  if (!newContactAttempts.has(remoteJid)) {
+    newContactAttempts.set(remoteJid, {
+      firstAttempt: Date.now(),
+      notified: false,
+    });
+
+    logger.info({ remoteJid }, "Primeira tentativa de contato detectada");
+  }
+}
+
+function markContactNotified(remoteJid) {
+  const info = newContactAttempts.get(remoteJid);
+  if (info) {
+    info.notified = true;
+  }
+}
+
+function isNewContact(remoteJid) {
+  const info = newContactAttempts.get(remoteJid);
+  return info && !info.notified;
+}
+
+// ==================== SISTEMA DE RECONEXÃO ====================
+
+const scheduleReconnect = (statusCode) => {
+  // Limpar timeout anterior se existir
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
+  // Verificar se excedeu máximo de tentativas
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    logger.error(
+      {
+        attempts: reconnectAttempts,
+        statusCode,
+      },
+      "Máximo de tentativas de reconexão excedido. Requer intervenção manual."
+    );
+    return;
+  }
+
+  // Calcular delay com backoff exponencial
+  const delay = Math.min(
+    INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttempts),
+    MAX_RECONNECT_DELAY
+  );
+
+  reconnectAttempts++;
+
+  logger.info(
+    {
+      attempt: reconnectAttempts,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
+      delay,
+      statusCode,
+    },
+    `Reconectando em ${delay}ms...`
+  );
+
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    connectToWhatsApp();
+  }, delay);
+};
+
+const resetReconnectAttempts = () => {
+  reconnectAttempts = 0;
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+};
+
 const connectToWhatsApp = async () => {
+  // ✅ Limpar socket anterior se existir
+  if (sock) {
+    try {
+      sock.end();
+    } catch (error) {
+      // Ignorar erros ao encerrar socket anterior
+    }
+    sock = null;
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(
     path.join(__dirname, "auth_info")
   );
@@ -276,6 +611,11 @@ const connectToWhatsApp = async () => {
     logger,
     auth: state,
     printQRInTerminal: false,
+    // ✅ Opções adicionais para estabilidade
+    connectTimeoutMs: 60000, // 60 segundos
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000, // Keep-alive a cada 30 segundos
+    qrTimeout: 60000, // QR code expira em 60 segundos
   });
 
   sock.ev.on("connection.update", async (update) => {
@@ -298,21 +638,73 @@ const connectToWhatsApp = async () => {
     if (connection === "open") {
       isReady = true;
       lastQrDataUrl = null;
+      lastConnectionTime = Date.now();
+      resetReconnectAttempts(); // ✅ Resetar contador ao conectar com sucesso
       logger.info("Conexão com WhatsApp estabelecida");
     } else if (connection === "close") {
       isReady = false;
       lastQrDataUrl = null;
+
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const error = lastDisconnect?.error;
 
-      logger.warn(
-        { statusCode, shouldReconnect },
-        "Conexão com WhatsApp encerrada"
-      );
+      // ✅ Tratamento específico por tipo de desconexão
+      switch (statusCode) {
+        case DisconnectReason.loggedOut:
+          logger.error(
+            "Logout detectado. Usuário fez logout manualmente. Reconexão não será tentada."
+          );
+          // ❌ Não reconectar
+          return;
 
-      if (shouldReconnect) {
-        connectToWhatsApp();
+        case DisconnectReason.restartRequired:
+          logger.warn(
+            { statusCode },
+            "WhatsApp requer restart. Reconectando com delay maior..."
+          );
+          // ✅ Reconectar, mas com delay maior
+          setTimeout(() => {
+            scheduleReconnect(statusCode);
+          }, 5000); // 5 segundos para restart required
+          return;
+
+        case DisconnectReason.badSession:
+          logger.warn(
+            { statusCode },
+            "Sessão corrompida detectada. Reconectando..."
+          );
+          scheduleReconnect(statusCode);
+          return;
+
+        case DisconnectReason.timedOut:
+          logger.warn({ statusCode }, "Timeout de conexão. Reconectando...");
+          scheduleReconnect(statusCode);
+          return;
+
+        case DisconnectReason.connectionClosed:
+        case DisconnectReason.connectionLost:
+          logger.warn({ statusCode }, "Conexão perdida. Reconectando...");
+          scheduleReconnect(statusCode);
+          return;
+
+        case DisconnectReason.replaced:
+          logger.error(
+            { statusCode },
+            "Outro dispositivo conectou. Reconexão não será tentada."
+          );
+          // ❌ Não reconectar (outro dispositivo está usando)
+          return;
+
+        default:
+          logger.warn(
+            { statusCode, error },
+            "Conexão encerrada por motivo desconhecido. Tentando reconectar..."
+          );
+          scheduleReconnect(statusCode);
+          return;
       }
+    } else if (connection === "connecting") {
+      logger.info("Conectando ao WhatsApp...");
     }
   });
 
@@ -330,6 +722,33 @@ const connectToWhatsApp = async () => {
             { remoteJid },
             "Sessão criptográfica estabelecida com contato novo"
           );
+
+          // ✅ NOVO: Aguardar um pouco e tentar reprocessar mensagens da fila
+          setTimeout(async () => {
+            await retryQueuedMessages(remoteJid);
+
+            // ✅ Se ainda há mensagens na fila, enviar mensagem automática opcional
+            const stillInQueue = messageRetryQueue.get(remoteJid);
+            if (stillInQueue && stillInQueue.length > 0) {
+              const numero = sanitizeNumber(remoteJid);
+
+              try {
+                await sock.sendMessage(remoteJid, {
+                  text: "Olá! Recebemos sua mensagem, mas pode ter havido um problema técnico na primeira tentativa. Por favor, envie novamente caso não tenha recebido resposta. Obrigado! 😊",
+                });
+
+                logger.info(
+                  { remoteJid, numero },
+                  "Mensagem automática enviada para novo contato após falha de descriptografia"
+                );
+              } catch (error) {
+                logger.error(
+                  { err: error, remoteJid },
+                  "Falha ao enviar mensagem automática para novo contato"
+                );
+              }
+            }
+          }, 2000); // Aguardar 2 segundos para garantir que a sessão está pronta
         }
       }
     }
@@ -352,27 +771,31 @@ const connectToWhatsApp = async () => {
           continue;
         }
 
+        // ✅ NOVO: Verificar se mensagem está na fila de retry
+        // Se estiver, remover da fila (já foi recuperada)
+        removeFromRetryQueue(remoteJid, messageObj.key);
+
+        // ✅ Rastrear tentativas de novos contatos
+        trackNewContactAttempt(remoteJid);
+
         // Verificar se a mensagem tem conteúdo válido ou é apenas uma atualização de pré-criptografia
         if (!messageObj.message) {
+          continue;
+        }
+
+        // Verificar se é mensagem pré-criptográfica
+        if (messageObj.message.senderKeyDistributionMessage) {
+          logger.debug(
+            { remoteJid },
+            "Mensagem pré-criptográfica recebida - sessão será estabelecida"
+          );
           continue;
         }
 
         const messageText = extractMessageText(messageObj.message);
         const mediaInfo = await processIncomingMedia(messageObj.message);
 
-        // Se não tem texto nem mídia, pode ser uma mensagem pré-criptográfica
-        // Tentar processar mesmo assim para não perder mensagens
         if (!messageText && !mediaInfo) {
-          // Verificar se é mensagem pré-criptográfica (senderKeyDistributionMessage)
-          if (messageObj.message.senderKeyDistributionMessage) {
-            logger.debug(
-              { remoteJid },
-              "Mensagem pré-criptográfica recebida - sessão será estabelecida"
-            );
-            continue;
-          }
-
-          // Se não é nenhum tipo conhecido, pular
           continue;
         }
 
@@ -387,19 +810,35 @@ const connectToWhatsApp = async () => {
           mensagem: messageText || "",
         };
 
-        if (mediaInfo) {
-          payload.media_type = mediaInfo.mediaType;
-          payload.media_caption = mediaInfo.caption || "";
+        if (mediaInfo && mediaInfo.uploadResult) {
+          const upload = mediaInfo.uploadResult;
 
-          const uploadData =
-            mediaInfo.uploadResult?.data || mediaInfo.uploadResult || {};
+          // ✅ Garantir que local_url está presente
+          if (upload.media_local_url || upload.media_url) {
+            payload.media_type = mediaInfo.mediaType;
+            payload.media_caption = mediaInfo.caption || "";
+            payload.media_local_url =
+              upload.media_local_url || upload.media_url;
+            payload.media_url = upload.media_url || upload.media_local_url;
+            payload.relative_path = upload.relative_path || null;
+            payload.media_mime = upload.mime || null;
 
-          payload.media_url = uploadData.media_url || null;
-          payload.media_local_url = uploadData.media_local_url || null;
-          payload.media_remote_url = uploadData.media_remote_url || null;
+            // ✅ NÃO incluir remote_url se já temos local_url
+            // (evita tentativa de download duplicado)
+          } else {
+            // ⚠️ Fallback: Se upload falhou, incluir apenas metadados
+            logger.warn(
+              { mediaType: mediaInfo.mediaType },
+              "Upload de mídia falhou - incluindo apenas metadados no webhook"
+            );
+            payload.media_type = mediaInfo.mediaType;
+            payload.media_caption = mediaInfo.caption || "";
+            // ⚠️ PHP tentará baixar do remote_url como fallback
+          }
         }
 
         await notifyPhpWebhook(payload);
+        markContactNotified(remoteJid);
       } catch (error) {
         // Tratar erros de descriptografia especificamente
         const errorMessage = error?.message || "";
@@ -410,16 +849,37 @@ const connectToWhatsApp = async () => {
           errorMessage.includes("failed to decrypt message") ||
           errorName === "SessionError"
         ) {
-          // Erro esperado com contatos novos - logar mas não quebrar o processamento
           const remoteJid = jidNormalizedUser(messageObj?.key?.remoteJid || "");
+
+          // ✅ Se é novo contato e mensagem falhou, notificar PHP mesmo sem conteúdo
+          if (isNewContact(remoteJid)) {
+            const numero = sanitizeNumber(remoteJid);
+
+            // Notificar PHP sobre tentativa de contato (mesmo sem mensagem descriptografada)
+            await notifyPhpWebhook({
+              numero,
+              nome: `Contato ${numero.substring(numero.length - 4)}`, // Nome padrão
+              mensagem: "", // Vazio - indicando que não foi possível descriptografar
+              is_decryption_failed: true,
+              is_new_contact: true,
+              timestamp: Date.now(),
+            });
+
+            markContactNotified(remoteJid);
+          }
+
+          // ✅ MODIFICADO: Ao invés de apenas logar, adicionar à fila
+          if (remoteJid && messageObj?.key) {
+            addToRetryQueue(remoteJid, messageObj.key);
+          }
+
           logger.warn(
             {
               remoteJid,
               messageId: messageObj?.key?.id,
             },
-            "Mensagem não descriptografada (contato novo - próxima mensagem será processada)"
+            "Mensagem não descriptografada (contato novo) - adicionada à fila de retry"
           );
-          // Continuar processando outras mensagens
           continue;
         }
 
@@ -597,6 +1057,44 @@ app.get("/status", (_req, res) => {
     ready: isReady,
     qr: lastQrDataUrl,
   });
+});
+
+// ✅ Health check endpoint
+app.get("/health", (_req, res) => {
+  const health = {
+    status: isReady ? "healthy" : "unhealthy",
+    ready: isReady,
+    reconnectAttempts: reconnectAttempts,
+    maxReconnectAttempts: MAX_RECONNECT_ATTEMPTS,
+    lastConnection: lastConnectionTime || null,
+    uptime: process.uptime(),
+  };
+
+  const statusCode = isReady ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+// ✅ Endpoint de estatísticas da fila de retry
+app.get("/retry-queue/stats", (_req, res) => {
+  const stats = {
+    totalJids: messageRetryQueue.size,
+    totalMessages: 0,
+    messagesByJid: {},
+  };
+
+  for (const [remoteJid, queue] of messageRetryQueue.entries()) {
+    stats.totalMessages += queue.length;
+    stats.messagesByJid[remoteJid] = {
+      count: queue.length,
+      oldestTimestamp: Math.min(...queue.map((m) => m.timestamp)),
+      avgRetries:
+        queue.length > 0
+          ? queue.reduce((sum, m) => sum + m.retries, 0) / queue.length
+          : 0,
+    };
+  }
+
+  res.json(stats);
 });
 
 app.post("/enviar-msg", async (req, res) => {
