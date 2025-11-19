@@ -764,12 +764,157 @@ const connectToWhatsApp = async () => {
 
   sock.ev.on("creds.update", saveCreds);
 
+  // ✅ CORREÇÃO: Handler de erros do Baileys para capturar erros de descriptografia
+  // que podem acontecer antes do messages.upsert
+  if (sock.ev.listenerCount("error") === 0) {
+    sock.ev.on("error", async (error) => {
+      const errorMessage = error?.message || "";
+      const errorName = error?.name || "";
+      const errorStack = error?.stack || "";
+      const errorData = error?.data || error?.attributes || {};
+
+      logger.debug(
+        {
+          errorMessage,
+          errorName,
+          errorData: JSON.stringify(errorData).substring(0, 500),
+        },
+        "Evento error recebido do Baileys"
+      );
+
+      const isDecryptionError =
+        errorMessage.includes("No session record") ||
+        errorMessage.includes("failed to decrypt message") ||
+        errorMessage.includes("SessionError") ||
+        errorName === "SessionError" ||
+        errorStack.includes("SessionError");
+
+      if (isDecryptionError) {
+        // Tentar extrair JID do erro se disponível
+        const messageKey = errorData.key || {};
+        let rawRemoteJid = messageKey.remoteJid || errorData.remoteJid || "";
+        const senderPn = errorData.senderPn || messageKey.senderPn || "";
+
+        // ✅ CORREÇÃO: Priorizar senderPn se disponível (é mais confiável)
+        if (!rawRemoteJid || rawRemoteJid.endsWith("@lid")) {
+          if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+            rawRemoteJid = senderPn;
+            logger.debug(
+              {
+                original: messageKey.remoteJid,
+                usingSenderPn: senderPn,
+              },
+              "Usando senderPn do error handler em vez de remoteJid com @lid"
+            );
+          }
+        }
+
+        if (rawRemoteJid) {
+          let remoteJid = null;
+          try {
+            remoteJid = jidNormalizedUser(rawRemoteJid);
+            // Converter @lid para @s.whatsapp.net
+            if (remoteJid && remoteJid.endsWith("@lid")) {
+              const number = remoteJid.replace("@lid", "");
+              remoteJid = `${number}@s.whatsapp.net`;
+            }
+          } catch (e) {
+            // Se falhar, tentar usar senderPn como fallback
+            if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+              remoteJid = senderPn;
+            } else if (rawRemoteJid.endsWith("@lid")) {
+              // Converter @lid diretamente sem normalizar
+              const number = rawRemoteJid.replace("@lid", "");
+              remoteJid = `${number}@s.whatsapp.net`;
+            }
+          }
+
+          if (
+            remoteJid &&
+            remoteJid.endsWith("@s.whatsapp.net") &&
+            messageKey?.id
+          ) {
+            // Adicionar à fila de retry
+            addToRetryQueue(remoteJid, messageKey);
+
+            // Se é novo contato, notificar PHP
+            if (isNewContact(remoteJid)) {
+              const numero = sanitizeNumber(remoteJid);
+              try {
+                await notifyPhpWebhook({
+                  numero,
+                  nome: `Contato ${numero.substring(numero.length - 4)}`,
+                  mensagem: "",
+                  is_decryption_failed: true,
+                  is_new_contact: true,
+                  timestamp: Date.now(),
+                });
+                markContactNotified(remoteJid);
+                logger.info(
+                  {
+                    remoteJid,
+                    numero,
+                    messageId: messageKey.id,
+                  },
+                  "Novo contato notificado ao PHP via error handler"
+                );
+              } catch (notifyError) {
+                logger.error(
+                  {
+                    err: notifyError,
+                    remoteJid,
+                  },
+                  "Falha ao notificar PHP sobre novo contato (error handler)"
+                );
+              }
+            }
+
+            logger.warn(
+              {
+                remoteJid,
+                messageId: messageKey.id,
+                rawRemoteJid: messageKey.remoteJid,
+                senderPn,
+                errorMessage,
+              },
+              "Erro de descriptografia capturado no error handler - adicionado à fila"
+            );
+          } else {
+            logger.warn(
+              {
+                remoteJid,
+                rawRemoteJid: messageKey.remoteJid,
+                senderPn,
+                messageKeyId: messageKey?.id,
+              },
+              "Erro de descriptografia capturado mas não foi possível extrair JID válido"
+            );
+          }
+        }
+      }
+    });
+  }
+
   // Handler para mensagens atualizadas (incluindo pré-criptográficas de contatos novos)
   sock.ev.on("messages.update", async (updates) => {
     for (const update of updates) {
       // Processar senderKeyDistributionMessage para estabelecer sessão com contatos novos
       if (update.update?.message?.senderKeyDistributionMessage) {
-        const remoteJid = jidNormalizedUser(update.key?.remoteJid || "");
+        let remoteJid = null;
+        try {
+          remoteJid = jidNormalizedUser(update.key?.remoteJid || "");
+          // ✅ CORREÇÃO: Converter @lid para @s.whatsapp.net também em messages.update
+          if (remoteJid && remoteJid.endsWith("@lid")) {
+            const number = remoteJid.replace("@lid", "");
+            remoteJid = `${number}@s.whatsapp.net`;
+          }
+        } catch (error) {
+          // Tentar usar senderPn como fallback
+          const senderPn = update.key?.senderPn || "";
+          if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+            remoteJid = senderPn;
+          }
+        }
 
         if (remoteJid && remoteJid.endsWith("@s.whatsapp.net")) {
           logger.debug(
@@ -840,15 +985,57 @@ const connectToWhatsApp = async () => {
         try {
           remoteJid = jidNormalizedUser(messageObj.key.remoteJid || "");
         } catch (error) {
-          rejectReason = `Erro ao normalizar JID: ${error.message}`;
-          logger.error(
-            {
-              err: error,
-              rawRemoteJid: messageObj.key.remoteJid,
-            },
-            "Erro ao normalizar remoteJid"
-          );
-          continue;
+          // ✅ CORREÇÃO: Tentar usar senderPn como fallback
+          const senderPn = messageObj.key?.senderPn || "";
+          if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+            remoteJid = senderPn;
+            logger.debug(
+              {
+                rawRemoteJid: messageObj.key.remoteJid,
+                fallbackJid: senderPn,
+              },
+              "Usando senderPn como fallback para remoteJid"
+            );
+          } else {
+            rejectReason = `Erro ao normalizar JID: ${error.message}`;
+            logger.error(
+              {
+                err: error,
+                rawRemoteJid: messageObj.key.remoteJid,
+                senderPn,
+              },
+              "Erro ao normalizar remoteJid e senderPn não disponível"
+            );
+            continue;
+          }
+        }
+
+        // ✅ CORREÇÃO: Converter JIDs com @lid para @s.whatsapp.net
+        // O Baileys às vezes retorna @lid para novos contatos durante handshake
+        // Priorizar senderPn se disponível (é mais confiável)
+        if (remoteJid && remoteJid.endsWith("@lid")) {
+          const senderPn = messageObj.key?.senderPn || "";
+          if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+            remoteJid = senderPn;
+            logger.debug(
+              {
+                original: messageObj.key.remoteJid,
+                usingSenderPn: senderPn,
+              },
+              "Usando senderPn em vez de remoteJid com @lid"
+            );
+          } else {
+            // Converter @lid para @s.whatsapp.net
+            const number = remoteJid.replace("@lid", "");
+            remoteJid = `${number}@s.whatsapp.net`;
+            logger.debug(
+              {
+                original: messageObj.key.remoteJid,
+                converted: remoteJid,
+              },
+              "JID convertido de @lid para @s.whatsapp.net"
+            );
+          }
         }
 
         // ✅ ACEITAR também mensagens de grupos (@g.us) e broadcasts (@broadcast)
@@ -861,9 +1048,25 @@ const connectToWhatsApp = async () => {
         ) {
           rejectReason = `JID não suportado: ${remoteJid}`;
           logger.debug(
-            { remoteJid, messageId: messageObj.key?.id },
+            {
+              remoteJid,
+              messageId: messageObj.key?.id,
+              rawRemoteJid: messageObj.key.remoteJid,
+            },
             "Mensagem rejeitada - JID não é individual, grupo ou broadcast"
           );
+
+          // ✅ Rastrear mensagens rejeitadas por JID inválido
+          rejectedMessages.unshift({
+            timestamp: Date.now(),
+            remoteJid: remoteJid || messageObj.key?.remoteJid || "unknown",
+            messageId: messageObj.key?.id,
+            reason: rejectReason,
+            rawRemoteJid: messageObj.key.remoteJid,
+          });
+          if (rejectedMessages.length > MAX_REJECTED_TRACK) {
+            rejectedMessages.pop();
+          }
           continue;
         }
 
@@ -1104,13 +1307,51 @@ const connectToWhatsApp = async () => {
           errorStack.includes("SessionError");
 
         if (isDecryptionError) {
-          const remoteJidFallback =
+          let remoteJidFallback =
             remoteJid || jidNormalizedUser(messageObj?.key?.remoteJid || "");
+
+          // ✅ CORREÇÃO: Tentar usar senderPn como fallback se JID normalizado falhar
+          if (
+            (!remoteJidFallback ||
+              !remoteJidFallback.endsWith("@s.whatsapp.net")) &&
+            messageObj?.key?.senderPn
+          ) {
+            const senderPn = messageObj.key.senderPn;
+            if (senderPn && senderPn.endsWith("@s.whatsapp.net")) {
+              remoteJidFallback = senderPn;
+              logger.debug(
+                {
+                  original: messageObj?.key?.remoteJid,
+                  fallbackJid: senderPn,
+                },
+                "Usando senderPn como fallback no catch de erro de descriptografia"
+              );
+            }
+          }
+
+          // ✅ CORREÇÃO: Converter @lid para @s.whatsapp.net também no catch
+          if (remoteJidFallback && remoteJidFallback.endsWith("@lid")) {
+            const number = remoteJidFallback.replace("@lid", "");
+            remoteJidFallback = `${number}@s.whatsapp.net`;
+            logger.debug(
+              {
+                original: messageObj?.key?.remoteJid,
+                converted: remoteJidFallback,
+              },
+              "JID convertido de @lid para @s.whatsapp.net no catch de erro"
+            );
+          }
 
           if (
             remoteJidFallback &&
-            remoteJidFallback.endsWith("@s.whatsapp.net")
+            (remoteJidFallback.endsWith("@s.whatsapp.net") ||
+              remoteJidFallback.endsWith("@lid"))
           ) {
+            // ✅ Se terminar com @lid, converter antes de processar
+            if (remoteJidFallback.endsWith("@lid")) {
+              const number = remoteJidFallback.replace("@lid", "");
+              remoteJidFallback = `${number}@s.whatsapp.net`;
+            }
             // ✅ Se é novo contato e mensagem falhou, notificar PHP mesmo sem conteúdo
             if (isNewContact(remoteJidFallback)) {
               const numero = sanitizeNumber(remoteJidFallback);
