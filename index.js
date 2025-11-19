@@ -766,7 +766,7 @@ const connectToWhatsApp = async () => {
 
   // ✅ CORREÇÃO: Handler de erros do Baileys para capturar erros de descriptografia
   // que podem acontecer antes do messages.upsert
-  if (sock.ev.listenerCount("error") === 0) {
+  try {
     sock.ev.on("error", async (error) => {
       const errorMessage = error?.message || "";
       const errorName = error?.name || "";
@@ -893,6 +893,12 @@ const connectToWhatsApp = async () => {
         }
       }
     });
+  } catch (errorHandlerError) {
+    // Se não houver evento "error" ou falhar, apenas logar
+    logger.debug(
+      { err: errorHandlerError },
+      "Não foi possível registrar handler de erro global (pode não ser suportado)"
+    );
   }
 
   // Handler para mensagens atualizadas (incluindo pré-criptográficas de contatos novos)
@@ -1125,9 +1131,14 @@ const connectToWhatsApp = async () => {
         let messageText = null;
         try {
           messageText = extractMessageText(messageObj.message);
-          // Se retornar null, é mensagem de protocolo - ignorar
+          // Se retornar null, é mensagem de protocolo - ignorar mas continuar processamento
+          // (pode ter mídia mesmo se for protocolo)
           if (messageText === null) {
-            continue;
+            logger.debug(
+              { remoteJid, messageId: messageObj.key?.id },
+              "Mensagem de protocolo detectada - continuando para verificar mídia"
+            );
+            // Não fazer continue aqui - pode ter mídia
           }
         } catch (error) {
           logger.warn(
@@ -1138,7 +1149,8 @@ const connectToWhatsApp = async () => {
             },
             "Erro ao extrair texto da mensagem - continuando com processamento de mídia"
           );
-          // Continuar mesmo se erro na extração de texto
+          // Continuar mesmo se erro na extração de texto - definir como string vazia
+          messageText = "";
         }
 
         // ✅ Processar mídia com tratamento de erro melhorado
